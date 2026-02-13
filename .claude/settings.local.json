@@ -4,7 +4,11 @@
       "Bash(dir:*)",
       "Bash(where:*)",
       "Bash(ssh:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(chmod:*)",
+      "Bash(./.vscode/cfdlab-mac.sh:*)",
+      "Bash(/Volumes/Seagate/D3Q27_PerioicHill/.vscode/cfdlab-mac.sh gpus)",
+      "Bash(/Volumes/Seagate/D3Q27_PerioicHill/.vscode/cfdlab-mac.sh:*)"
     ]
   }
 }
