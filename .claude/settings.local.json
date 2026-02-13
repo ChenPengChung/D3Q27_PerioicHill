@@ -3,7 +3,8 @@
     "allow": [
       "Bash(dir:*)",
       "Bash(where:*)",
-      "Bash(ssh:*)"
+      "Bash(ssh:*)",
+      "Bash(ls:*)"
     ]
   }
 }
