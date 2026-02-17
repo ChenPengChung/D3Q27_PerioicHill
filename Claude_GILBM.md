@@ -89,17 +89,29 @@ z_h[j*NZ6+k] = tanhFunction(total, minSize, a, k-3, NZ6-7) + HillFunction(y_j)
 
 **實際情況**（理論分析）：
 - GILBM 中，ζ=0 處的格點是 **Wet Node**（壁面在格點上）
-- 逆變速度 **空間變化**：`ẽ_α_ζ = [e_z - H'(y)·e_y/(LZ-H)] / (LZ-H)`
+- 逆變速度 **空間變化**：`ẽ_α_ζ = e_αy·(∂ζ/∂y) + e_αz·(∂ζ/∂z)`
 - **不再是標準晶格** → Half-Way BB 的距離條件不滿足
+- **需要 BC 的方向不再固定**：取決於 `sign(ẽ_α_ζ)`，隨壁面位置 (i,j) 變化
 
-**正確方法**：
-- **Non-Equilibrium Extrapolation**（Phase 1 主要）
+**正確方法（漸進式開發）**：
+
+- **Phase 1: Non-Equilibrium Extrapolation**（框架驗證用）
   ```
   f_α|wall = f_α^eq|wall + (1-ω)·(f_α - f_α^eq)|fluid
   ```
-- **Chapman-Enskog 展開**（Phase 2 可選，更精確）
+  - 搭配**動態方向判別** `NeedsBoundaryCondition(alpha, metric)`
+  - 適用於低 Re (≤200)，快速跑通框架
+  - 理論局限：f^neq 的外推忽略了度量項的空間變化
 
-**影響**：Phase 1.4 邊界條件改為 Non-Equilibrium 方法
+- **Phase 2: Chapman-Enskog BC**（生產級方法，理論更嚴謹）
+  ```
+  f_α|wall = f_α^eq · [1 - ωΔt·Q_αij·S_ij / (2c_s⁴)]
+  ```
+  - 顯式使用物理空間應變率張量 S_ij，通過度量項正確轉換
+  - 與 GILBM 的 C-E 理論框架**自洽**（Imamura 2005 核心方法）
+  - 不依賴 f^neq 外推假設，適用於高 Re 紊流
+
+**影響**：Phase 1.4 使用 NEE + 動態方向判別；Phase 2.5（新增）升級到 C-E BC
 
 ---
 
@@ -326,59 +338,66 @@ __device__ double Interpolate_Order2_3D(
 
 三線性插值（8 個點）。
 
-#### 任務 1.4: 壁面邊界條件 (3天)
+#### 任務 1.4: 壁面邊界條件 — NEE + 動態方向判別 (2天)
 
 **新建檔案**: `gilbm/boundary_conditions.h`
 
 **關鍵修正**：Wet Node（ζ=0）+ 逆變速度變形 → **不能用 Half-Way Bounce Back**！
 
-實作**兩種方法**並支持切換：
+**Phase 1 實作 NEE**（框架驗證用，Phase 2.5 再升級到 C-E BC）：
 
 ```cuda
-// 方法 1: Non-Equilibrium Extrapolation (主要，Wet Node 適用)
-__device__ void NonEquilibriumExtrapolation(
-    double *f_in,
-    double *f_eq_wall,     // 壁面平衡態
-    double *f_fluid,       // 最近的流體格點分佈函數
-    double *f_eq_fluid,    // 流體格點平衡態
-    double omega,
-    int k
+// ===== 動態方向判別（Phase 1 & 2 共用）=====
+// 在 GILBM 中，需要 BC 的方向不再固定！
+// 取決於逆變速度 ẽ_α_ζ 的符號，隨壁面位置 (i,j) 變化
+__device__ bool NeedsBoundaryCondition(
+    int alpha,                // 離散速度方向 (0-18)
+    const MetricTerms &metric, // 壁面度量項
+    bool is_bottom_wall       // ζ=0 (bottom) or ζ=1 (top)
 ) {
-    if (k == 3) {  // 下壁面 Wet Node
-        // f_α|wall = f_α^eq|wall + (1-ω)·(f_α - f_α^eq)|fluid
-        for (int alpha = 0; alpha < 19; alpha++) {
-            f_in[alpha] = f_eq_wall[alpha] +
-                          (1.0 - omega) * (f_fluid[alpha] - f_eq_fluid[alpha]);
+    // 計算 ζ 方向逆變速度
+    double e_tilde_zeta = e[alpha][1] * metric.dzeta_dy
+                        + e[alpha][2] * metric.dzeta_dz;
+
+    // 上風點在壁外 → 需要邊界條件
+    if (is_bottom_wall) return (e_tilde_zeta > 0);
+    else                return (e_tilde_zeta < 0);
+}
+
+// ===== Phase 1: Non-Equilibrium Extrapolation（框架驗證）=====
+// 理論局限：f^neq 外推忽略度量項空間變化，低 Re 下可接受
+__device__ void NonEquilibriumExtrapolation_GILBM(
+    double *f_wall,           // 壁面分佈函數 (output)
+    double *f_eq_wall,        // 壁面平衡態 (u_wall=0)
+    double *f_fluid,          // ζ=Δζ 最近流體格點分佈函數
+    double *f_eq_fluid,       // 流體格點平衡態
+    double omega,
+    const MetricTerms &metric // 壁面度量項
+) {
+    for (int alpha = 0; alpha < 19; alpha++) {
+        if (NeedsBoundaryCondition(alpha, metric, true)) {
+            // 只對「上風點在壁外」的方向施加 NEE
+            f_wall[alpha] = f_eq_wall[alpha] +
+                            (1.0 - omega) * (f_fluid[alpha] - f_eq_fluid[alpha]);
         }
+        // 其他方向保持正常 GILBM streaming 結果
     }
 }
 
-// 方法 2: Chapman-Enskog 展開（精度更高）
-__device__ void ChapmanEnskogBC(
-    double *f_in,
-    double *f_eq,
-    double *velocity_gradient,  // ∂u/∂ζ（計算空間）
-    double omega,
-    double dt,
-    int k
-) {
-    // fα|wall = fα^eq [1 - ωΔt·(3Ui,aUi,b/c² - δab)·∂ua/∂xb]
-    // 考慮逆變速度的影響
-    // ... 實作
-}
-
-// 切換開關
-#define BOUNDARY_METHOD 1  // 1: NonEqExtrap, 2: ChapmanEnskog
+// 切換開關（Phase 1 預設 NEE，Phase 2 切換到 C-E）
+#define BOUNDARY_METHOD 1  // 1: NEE (Phase 1), 2: C-E (Phase 2)
 ```
 
-**理論依據**：
+**理論依據（為何 NEE 在 Phase 1 可用）**：
 - 在 GILBM 中，ζ=0 處的格點是 **Wet Node**
-- 逆變速度 `ẽ_α_ζ` **空間變化**，不滿足 Half-Way BB 的標準晶格條件
-- 必須用 **Non-Equilibrium 方法**處理非平衡項
+- 逆變速度 `ẽ_α_ζ` **空間變化** → 必須**動態判別**需要 BC 的方向
+- NEE 的 f^neq 外推在低 Re (≤200) 和平滑座標變換下是合理的近似
+- **Phase 2.5 將升級到 Chapman-Enskog BC**（理論自洽，適用高 Re）
 
 **驗證**:
 1. 平板 Poiseuille 流（解析解）
 2. 檢查壁面無滑移條件：`|u_wall| < 1e-6`
+3. **方向判別驗證**：山丘最高點（H'=0）→ 退化為標準 5 方向；斜面 → 額外方向
 
 #### 任務 1.5: 整合到 evolution kernel (2天)
 
@@ -401,19 +420,35 @@ __global__ void stream_collide_GILBM_Order2(
         // 1. 逆變速度
         ContravariantVelocities(metrics[index], alpha, e_eta, e_xi, e_zeta);
 
-        // 2. RK2 上風點
-        RK2_UpwindPosition(..., eta_up, xi_up, zeta_up);
+        // 2. 壁面判斷：上風點是否在域外？
+        bool at_bottom_wall = (k == 3);
+        bool at_top_wall = (k == NZ6 - 4);
+        bool needs_bc = false;
 
-        // 3. 2階插值
-        F_in[alpha] = Interpolate_Order2_3D(...);
+        if (at_bottom_wall)
+            needs_bc = NeedsBoundaryCondition(alpha, metrics[index], true);
+        if (at_top_wall)
+            needs_bc = NeedsBoundaryCondition(alpha, metrics[index], false);
+
+        if (needs_bc) {
+            // 壁面 BC（上風點在域外，不能插值）
+            #if BOUNDARY_METHOD == 1
+                // Phase 1: NEE
+                F_in[alpha] = f_eq_wall[alpha] +
+                    (1.0 - omega) * (f_fluid[alpha] - f_eq_fluid[alpha]);
+            #elif BOUNDARY_METHOD == 2
+                // Phase 2: C-E BC（設置所有壁面方向）
+                F_in[alpha] = f_CE_wall[alpha];
+            #endif
+        } else {
+            // 正常 GILBM streaming
+            // 3. RK2 上風點
+            RK2_UpwindPosition(..., eta_up, xi_up, zeta_up);
+
+            // 4. 插值
+            F_in[alpha] = Interpolate_Order2_3D(...);
+        }
     }
-
-    // 4. 壁面 BC
-    #if BOUNDARY_METHOD == 1
-        HalfwayBounceBack(F_in, k, NZ6);
-    #elif BOUNDARY_METHOD == 2
-        ChapmanEnskogBC(F_in, ...);
-    #endif
 
     // 5. MRT 碰撞（複製現有代碼）
     MRT_Collision(F_in, F_out, rho, u, v, w);
@@ -544,6 +579,74 @@ p = log(E_coarse - E_medium) / log(E_medium - E_fine) / log(2)
 
 **交付物**: 6階精度 GILBM，與 ISLBM 精度相當或更優
 
+#### 任務 2.5: Chapman-Enskog 壁面邊界條件升級 (2天)
+
+**目標**: 將壁面 BC 從 Phase 1 的 NEE 升級到理論自洽的 C-E 方法。
+
+**理論基礎**：
+- Imamura (2005) 基於 Chapman-Enskog 展開推導 GILBM 宏觀方程等價性
+- 邊界條件也應在同一理論框架下 → C-E BC 是自洽選擇
+- NEE 的 f^neq 外推忽略度量項空間變化，高 Re 下精度不足
+
+**更新 `gilbm/boundary_conditions.h`**:
+
+```cuda
+// ===== Phase 2: Chapman-Enskog BC（生產級）=====
+__device__ void ChapmanEnskogBC_GILBM(
+    double *f_wall,           // 壁面分佈函數 (output)
+    double rho_wall,          // 壁面密度（從 ζ=Δζ 外推）
+    const MetricTerms &metric, // 壁面度量項
+    double *du_dzeta,         // ∂u_i/∂ζ|ζ=0（計算空間速度梯度，單側差分）
+    double *du_dxi,           // ∂u_i/∂ξ|ζ=0（主流向速度梯度）
+    double omega,
+    double dt
+) {
+    // 1. 轉換速度梯度到物理空間
+    //    ∂u/∂z = (∂u/∂ζ) · (∂ζ/∂z)
+    //    ∂u/∂y = (∂u/∂ξ) · (∂ξ/∂y) + (∂u/∂ζ) · (∂ζ/∂y)
+    double S[3][3];  // 物理空間應變率張量
+    S[0][2] = 0.5 * du_dzeta[0] * metric.dzeta_dz;  // ∂u/∂z
+    S[1][2] = 0.5 * (du_dxi[1] / LY + du_dzeta[1] * metric.dzeta_dz);
+    S[2][2] = du_dzeta[2] * metric.dzeta_dz;
+    // ... 完整 S_ij（含對稱項和交叉項）
+
+    // 2. 計算壁面平衡態 (u_wall = 0)
+    double f_eq[19];
+    double u_wall[3] = {0.0, 0.0, 0.0};
+    ComputeEquilibrium(rho_wall, u_wall, f_eq);
+
+    // 3. C-E 修正：所有 19 個方向
+    double cs2 = 1.0 / 3.0;
+    for (int alpha = 0; alpha < 19; alpha++) {
+        double Qij_Sij = 0.0;
+        for (int a = 0; a < 3; a++)
+            for (int b = 0; b < 3; b++)
+                Qij_Sij += (e[alpha][a]*e[alpha][b] - cs2*(a==b)) * S[a][b];
+
+        f_wall[alpha] = f_eq[alpha] * (1.0 - omega * dt * Qij_Sij / (2.0 * cs2 * cs2));
+    }
+}
+```
+
+**壁面速度梯度計算**（單側 2 階差分）：
+```cuda
+// ∂u/∂ζ|ζ=0 ≈ (-3u|k=3 + 4u|k=4 - u|k=5) / (2Δζ)
+// 其中 u|k=3 = 0（無滑移），所以：
+// ∂u/∂ζ|wall ≈ (4u|k=4 - u|k=5) / (2Δζ)
+```
+
+**驗證**:
+1. Poiseuille 流：C-E BC vs NEE 精度對比（預期 C-E 更接近解析解）
+2. Periodic Hill Re=200 壁面剪應力 τ_wall(y)：與 Mellen 2000 DNS 對比
+3. 方向判別一致性：C-E BC 對所有 19 方向設置（不需要方向判別），結果應自洽
+
+**切換預設**：
+```cuda
+#define BOUNDARY_METHOD 2  // Phase 2 起預設使用 C-E BC
+```
+
+**交付物**: C-E BC 壁面條件，壁面剪應力精度提升
+
 ---
 
 ### Phase 3: Local Time Step 加速 (3-5 天)
@@ -604,7 +707,7 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 | `gilbm/gilbm_transform.h` | 1 | 逆變速度計算 |
 | `gilbm/gilbm_rk2_upwind.h` | 1 | RK2 上風點追蹤 |
 | `gilbm/interpolationGILBM_order2.h` | 1 | 2階插值 |
-| `gilbm/boundary_conditions.h` | 1 | **Non-Equilibrium Extrapolation** + Chapman-Enskog |
+| `gilbm/boundary_conditions.h` | 1→2 | Phase 1: **NEE** + 動態方向判別；Phase 2.5: **C-E BC**（生產級） |
 | `gilbm/weight_table.h` | 2 | **全局 Lagrange 權重表**（記憶體優化） |
 | `evolution_gilbm.h` | 1 | GILBM streaming-collision kernel |
 | `gilbm/interpolationGILBM_order6.h` | 2 | 6階插值 |
@@ -694,16 +797,22 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 **症狀**:
 - 壁面剪應力誤差 > 20%
 - 壁面速度不為零（無滑移條件失效）
+- 方向判別遺漏（部分方向未施加 BC）
 
 **診斷**:
-1. 檢查逆變速度計算是否正確
-2. 驗證度量項數值微分精度
-3. 檢查 Non-Equilibrium Extrapolation 的流體格點選擇
+1. 檢查 `NeedsBoundaryCondition()` 動態方向判別是否正確
+   - 在 H'(y)=0 處應退化為標準 5 方向
+   - 在山丘斜面打印實際需要 BC 的方向集合
+2. 驗證度量項數值微分精度（∂ζ/∂y, ∂ζ/∂z）
+3. Phase 1 (NEE): 檢查流體格點（ζ=Δζ）的 f^neq 是否合理
+4. Phase 2 (C-E): 檢查壁面速度梯度單側差分精度
 
-**降級方案**: 切換到 Chapman-Enskog 邊界條件：
+**升級方案**（Phase 1 → Phase 2）:
+- 如果 NEE 壁面剪應力誤差過大，提前切換到 C-E BC：
 ```cuda
-#define BOUNDARY_METHOD 2
+#define BOUNDARY_METHOD 2  // 升級到 Chapman-Enskog BC
 ```
+- C-E BC 不依賴 f^neq 外推，直接從速度梯度重建壁面分佈
 
 ### 風險 4: 度量項計算錯誤
 
@@ -738,10 +847,11 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 |------|--------------|--------------|---------|
 | **度量項計算** | 解析導數 H'(y) | **離散 Jacobian**（數值微分） | `initialization.h` 的 tanh 拉伸 |
 | **插值權重** | "無需預計算" | **全局權重表**（14 KB） | `memory.h` 的 56 個陣列分析 |
-| **邊界條件** | Half-Way Bounce Back | **Non-Equilibrium Extrapolation** | Wet Node + 逆變速度變形 |
+| **邊界條件** | Half-Way Bounce Back | Phase 1: **NEE + 動態方向判別**；Phase 2: **C-E BC** | Wet Node + 逆變速度變形 + C-E 自洽性 |
+| **方向判別** | 固定 5 方向 | **動態 `NeedsBoundaryCondition()`**（基於 ẽ_α_ζ） | 逆變速度隨空間變化 |
 | **Phase 0 檔案** | `model_derivative.h` | `discrete_jacobian.h` | 基於實際網格座標 |
 | **記憶體優化** | 未量化 | **減少 130×**（3.4 MB → 14 KB） | 權重陣列統計 |
-| **邊界精度** | 依賴標準晶格 | 考慮**速度梯度修正** | Chapman-Enskog 理論 |
+| **邊界精度** | 依賴標準晶格 | Phase 2: **C-E BC 顯式應變率張量** | Imamura 2005 C-E 理論框架 |
 
 ### 關鍵發現來源
 
@@ -755,8 +865,10 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 
 3. **邊界條件**：
    - 文件：`/Users/yetianzhong/Desktop/4.GitHub/D3Q27_PeriodicHill/evolution.h:147-160`
-   - 現有：k=3 的 Half-Way BB（Wet Node，但 Cartesian 框架）
-   - GILBM：Wet Node + 逆變速度 → 需要 Non-Equilibrium 方法
+   - 現有：k=3 的 Half-Way BB（Wet Node，但 Cartesian 框架，固定 5 方向）
+   - GILBM Phase 1：NEE + **動態方向判別** `NeedsBoundaryCondition(alpha, metric)`
+   - GILBM Phase 2：**C-E BC**（理論自洽，顯式應變率張量，不依賴 f^neq 外推）
+   - 關鍵新增：`NeedsBoundaryCondition()` 基於 `sign(ẽ_α_ζ)` 動態判斷
 
 ---
 
@@ -774,7 +886,8 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 - Phase 2.1-2.2: 6階插值實作 (3 天)
 
 ### 第 4 週
-- Phase 2.3-2.4: 性能優化 + 精度驗證 (5-6 天)
+- Phase 2.3-2.4: 性能優化 + 精度驗證 (4-5 天)
+- Phase 2.5: **C-E BC 壁面邊界升級** (2 天)
 
 ### 第 5-6 週
 - Phase 3: Local time step (3-5 天)
@@ -820,7 +933,23 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 
 1. **確認計劃**: 用戶批准後開始實作
 2. **創建開發分支**: `git checkout -b feature/gilbm-implementation`
-3. **Phase 0 啟動**: 實作 `HillFunctionDerivative`
+3. **Phase 0 啟動**: 實作 `discrete_jacobian.h`
 4. **建立測試框架**: 單元測試腳本
 
 **準備開始實作！**
+
+---
+
+## 理論討論記錄
+
+### Q: Wet-Node NEE 在扭曲晶格下是否成立？
+
+**結論**：NEE 在 GILBM 扭曲晶格下**有條件成立**，但 C-E BC 是理論上更嚴謹的選擇。
+
+**分析要點**：
+1. NEE 的 f^neq 外推忽略了度量項的空間變化 → 低 Re 可接受，高 Re 誤差顯著
+2. 需要 BC 的方向不再固定（取決於逆變速度 ẽ_α_ζ）→ 需動態判別
+3. C-E BC 與 GILBM 的 Chapman-Enskog 理論框架自洽（Imamura 2005）
+4. C-E BC 顯式使用物理空間應變率張量，通過度量項自然處理座標變換
+
+**決策**：漸進式開發 — Phase 1 用 NEE 跑通框架，Phase 2.5 升級到 C-E BC。
