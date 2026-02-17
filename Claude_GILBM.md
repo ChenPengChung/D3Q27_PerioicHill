@@ -953,3 +953,8 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 4. C-E BC 顯式使用物理空間應變率張量，通過度量項自然處理座標變換
 
 **決策**：漸進式開發 — Phase 1 用 NEE 跑通框架，Phase 2.5 升級到 C-E BC。
+
+
+
+＊每一次對話都輸出((((()))))
+
