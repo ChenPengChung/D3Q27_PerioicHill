@@ -16,12 +16,12 @@
 
 1. **複雜的 BFL 邊界條件**
    - 12 個邊界判斷函數處理山丘表面
-   - 56+ 個插值權重陣列需要預計算和存儲
+   - 56+ 個插值權重陣列需要預計算和存儲（~3.4 MB）
    - 壁面附近精度下降
 
 2. **非均勻網格的複雜性**
-   - Z 方向使用 tanh 拉伸，但仍在物理空間插值
-   - 插值權重計算繁瑣，記憶體開銷大
+   - Z 方向使用 tanh 拉伸：`z_h[j*NZ6+k] = tanhFunction(...) + H(y_j)`
+   - 插值權重計算繁瑣，記憶體開銷大（Xi 方向佔 2.43 MB）
 
 3. **精度需求**
    - 紊流分析需要 6 階空間精度
@@ -35,11 +35,71 @@
 - **計算空間** (η,ξ,ζ): **均勻網格**、貼體邊界
 
 **核心優勢**：
-1. ✅ 插值在均勻的 (η,ξ,ζ) 空間進行，簡化計算
-2. ✅ 壁面邊界簡化為 bounce-back（網格貼體）
-3. ✅ 消除 BFL 的所有複雜性
+1. ✅ 插值在均勻的 (η,ξ,ζ) 空間進行，可用**全局權重表**（記憶體減少 130×）
+2. ✅ 壁面邊界簡化（網格貼體），但需用 **Non-Equilibrium Extrapolation**（非 Half-Way BB）
+3. ✅ 消除 BFL 的複雜幾何判斷
 4. ✅ 保留 collision-streaming 範式（與現有 MRT 兼容）
 5. ✅ 可加入 local time step 加速穩態收斂 70-80%
+
+---
+
+## 🔑 關鍵技術修正（基於深度代碼分析）
+
+### **修正 1：度量項必須用離散 Jacobian**
+
+**原計劃錯誤**：只對 HillFunction 解析求導 H'(y)
+
+**實際情況**（從 `initialization.h` 發現）：
+```cpp
+z_h[j*NZ6+k] = tanhFunction(total, minSize, a, k-3, NZ6-7) + HillFunction(y_j)
+```
+- 每個格點 (j,k) 的物理座標 z 都不同
+- tanh 拉伸使座標映射變成**隱函數**
+
+**正確方法**：
+```cuda
+∂ζ/∂z ≈ (xi_h[k+1] - xi_h[k-1]) / (z_h[j*NZ6+k+1] - z_h[j*NZ6+k-1])
+∂ζ/∂y ≈ 數值差分計算（考慮整個映射）
+```
+
+**影響**：Phase 0 改為實作 `discrete_jacobian.h`，不需要 `model_derivative.h`
+
+---
+
+### **修正 2：插值權重可用全局表優化**
+
+**原計劃不精確**：說"無需預計算"，實際上**仍需優化**
+
+**實際情況**（從 `memory.h` 發現）：
+- 現有 ISLBM：56+ 個陣列，每個 NYD6 × NZ6 × 7 doubles
+- 總記憶體：~3.4 MB（Xi 方向佔 2.43 MB）
+
+**GILBM 優勢**：
+- 計算空間 (η,ξ,ζ) **均勻** → 分數位置可預計算
+- **全局權重表**：256 個離散位置 × 7 權重 × 3 方向 = ~14 KB
+- **記憶體減少 130×**！
+
+**影響**：Phase 2 新增 `weight_table.h`，預計算全局表
+
+---
+
+### **修正 3：Wet Node 不能用 Half-Way Bounce Back**
+
+**原計劃錯誤**：直接用 `f5 ↔ f6` 交換（從 Cartesian 類比）
+
+**實際情況**（理論分析）：
+- GILBM 中，ζ=0 處的格點是 **Wet Node**（壁面在格點上）
+- 逆變速度 **空間變化**：`ẽ_α_ζ = [e_z - H'(y)·e_y/(LZ-H)] / (LZ-H)`
+- **不再是標準晶格** → Half-Way BB 的距離條件不滿足
+
+**正確方法**：
+- **Non-Equilibrium Extrapolation**（Phase 1 主要）
+  ```
+  f_α|wall = f_α^eq|wall + (1-ω)·(f_α - f_α^eq)|fluid
+  ```
+- **Chapman-Enskog 展開**（Phase 2 可選，更精確）
+
+**影響**：Phase 1.4 邊界條件改為 Non-Equilibrium 方法
 
 ---
 
@@ -58,23 +118,40 @@
 
 ### 2. 度量項 (Metric Terms)
 
+**關鍵修正**：必須使用**離散 Jacobian**（數值微分），而非解析導數！
+
 ```
-ζy = ∂ζ/∂y = -H'(y) / [LZ - H(y)]
-ζz = ∂ζ/∂z = 1 / [LZ - H(y)]
-J = LZ - H(y)  (Jacobian)
+∂ζ/∂z ≈ (xi_h[k+1] - xi_h[k-1]) / (z_h[j*NZ6+k+1] - z_h[j*NZ6+k-1])
+∂ζ/∂y ≈ (ζ_{j+1,k} - ζ_{j-1,k}) / (y_h[j+1] - y_h[j-1])
+J = LZ - H(y_j)  (每層不同)
 ```
 
-**關鍵**: `H'(y)` 需要解析求導（12 段導數）。
+**原因**：
+- 物理座標 `z_h[j*NZ6+k]` 依賴於 (j, k)（tanh 拉伸）
+- 解析 H'(y) 無法捕捉整個座標映射的複雜性
+- 必須基於**實際網格座標**計算度量項
 
 ### 3. 逆變速度 (Contravariant Velocities)
 
-對於 D3Q19 的每個方向 α，計算計算空間的速度：
+對於 D3Q19 的每個方向 α，根據**鏈式法則**計算計算空間的速度：
 
 ```
-ẽα_η = eα_x / LX                          (常數)
-ẽα_ξ = eα_y / LY                          (常數)
-ẽα_ζ = [eα_z + ζy·eα_y] · ζz             (空間變化！)
-     = [eα_z - H'(y)·eα_y/(LZ-H)] / (LZ-H)
+ẽα_η = eα_x · ∂η/∂x + eα_y · ∂η/∂y + eα_z · ∂η/∂z
+     = eα_x / LX                          (常數)
+
+ẽα_ξ = eα_x · ∂ξ/∂x + eα_y · ∂ξ/∂y + eα_z · ∂ξ/∂z
+     = eα_y / LY                          (常數)
+
+ẽα_ζ = eα_x · ∂ζ/∂x + eα_y · ∂ζ/∂y + eα_z · ∂ζ/∂z
+     = eα_y · (∂ζ/∂y) + eα_z · (∂ζ/∂z)  (空間變化！)
+```
+
+**實際計算**（每個格點 (i,j,k)）：
+```cuda
+double dzeta_dy = (xi_h[k] - xi_h_at_j_minus_1) / (y_h[j] - y_h[j-1]);
+double dzeta_dz = (xi_h[k+1] - xi_h[k-1]) / (z_h[j*NZ6+k+1] - z_h[j*NZ6+k-1]);
+
+ẽα_ζ = eα_y * dzeta_dy + eα_z * dzeta_dz;
 ```
 
 ### 4. RK2 上風點追蹤（關鍵！）
@@ -121,27 +198,34 @@ f_new[α] = F_out[α];
 
 ### Phase 0: 準備工作 (1-2 天)
 
-**目標**: 實作 `HillFunctionDerivative`，建立基準數據。
+**目標**: 實作**離散 Jacobian 計算**，建立基準數據。
 
 **任務**:
-1. 創建 `model_derivative.h`
-   - 解析求導 12 段三次多項式
-   - `H'(y) = 28a₁ + 56a₂y + 2352a₃y²` (對每段)
+1. ~~創建 `model_derivative.h`~~（不需要解析導數）
+
+2. **創建 `gilbm/discrete_jacobian.h`**
+   - 基於現有網格座標 `z_h[j*NZ6+k]`, `y_h[j]` 計算度量項
+   - 數值微分（2 階中心差分或 6 階 Lagrange）：
+     ```cuda
+     ∂ζ/∂z = (xi_h[k+1] - xi_h[k-1]) / (z_h[j*NZ6+k+1] - z_h[j*NZ6+k-1])
+     ∂ζ/∂y = ComputeNumerically(...)
+     ```
    - CPU + GPU 版本
 
-2. 單元測試
+3. 單元測試
    ```cuda
-   double dH_analytic = HillFunctionDerivative(1.5);
-   double dH_numeric = [HillFunction(1.5+ε) - HillFunction(1.5-ε)] / 2ε;
-   assert(|dH_analytic - dH_numeric| < 1e-4);
+   // 驗證度量項在已知點的數值
+   double dzeta_dz = ComputeMetric_Z(j, k, z_h, xi_h);
+   double dzeta_dy = ComputeMetric_Y(j, k, z_h, y_h, xi_h);
+   // 檢查 Jacobian > 0（流體區域）
    ```
 
-3. 運行現有 ISLBM 至收斂，保存基準數據
+4. 運行現有 ISLBM 至收斂，保存基準數據
    - `baseline_islbm/velocity_*.vtk`
    - `baseline_islbm/checkrho.dat`
    - 記錄分離泡位置 (x_sep, x_reatt)
 
-**交付物**: `model_derivative.h`, 基準數據
+**交付物**: `discrete_jacobian.h`, 基準數據
 
 ---
 
@@ -149,35 +233,59 @@ f_new[α] = F_out[α];
 
 **目標**: 實作完整 GILBM 框架，先用 2 階插值驗證正確性。
 
-#### 任務 1.1: 座標變換與度量項 (2天)
+#### 任務 1.1: 座標變換與度量項 (2-3天)
 
 **新建檔案**: `gilbm/gilbm_transform.h`
 
 ```cuda
 struct MetricTerms {
-    double zeta_y;  // -H'(y)/(LZ-H(y))
-    double zeta_z;  // 1/(LZ-H(y))
-    double J;       // LZ-H(y)
+    double dzeta_dy;  // ∂ζ/∂y（數值微分）
+    double dzeta_dz;  // ∂ζ/∂z（數值微分）
+    double J;         // Jacobian（用於體積修正）
 };
 
 __global__ void ComputeMetricTerms(
     MetricTerms *metrics,
-    double *y_coords,
-    double *z_coords,
-    double *dHdy,  // 預計算的 H'(y)
+    double *y_h,       // Y 座標陣列 [NYD6]
+    double *z_h,       // Z 座標陣列 [NYD6*NZ6]，按行存儲
+    double *xi_h,      // 標準化 ξ 座標 [NZ6]
     int NX, int NY, int NZ
-);
+) {
+    int j = ..., k = ...;
+
+    // 數值微分計算度量項
+    // ∂ζ/∂z：Z 方向（固定 j）
+    double dxi_dz = (xi_h[k+1] - xi_h[k-1]) /
+                    (z_h[j*NZ6+(k+1)] - z_h[j*NZ6+(k-1)]);
+
+    // ∂ζ/∂y：Y 方向（固定 k）
+    double dxi_dy = (xi_h[k] - ...) / (y_h[j] - y_h[j-1]);
+    // 需要考慮 Y 變化導致的 Z 變化
+
+    metrics[index].dzeta_dy = dxi_dy;
+    metrics[index].dzeta_dz = dxi_dz;
+    metrics[index].J = ...;  // 計算 Jacobian
+}
 
 __device__ void ContravariantVelocities(
     const MetricTerms &metric,
     const int alpha,  // 0-18
+    const double *e_physical,  // D3Q19 標準速度
     double &e_tilde_eta,
     double &e_tilde_xi,
     double &e_tilde_zeta
-);
+) {
+    e_tilde_eta = e_physical[0] / LX;
+    e_tilde_xi  = e_physical[1] / LY;
+    e_tilde_zeta = e_physical[1] * metric.dzeta_dy +
+                   e_physical[2] * metric.dzeta_dz;
+}
 ```
 
-**驗證**: 手算幾個點的度量項，對比 GPU 輸出。
+**驗證**:
+1. 手算幾個點的度量項，對比 GPU 輸出
+2. 檢查 Jacobian > 0（流體區域有效性）
+3. 對比數值微分 vs 有限差分精度
 
 #### 任務 1.2: RK2 上風點追蹤 (2-3天)
 
@@ -218,47 +326,59 @@ __device__ double Interpolate_Order2_3D(
 
 三線性插值（8 個點）。
 
-#### 任務 1.4: 壁面邊界條件 (2天)
+#### 任務 1.4: 壁面邊界條件 (3天)
 
 **新建檔案**: `gilbm/boundary_conditions.h`
 
-根據您的需求，實作**兩種方法**並支持切換：
+**關鍵修正**：Wet Node（ζ=0）+ 逆變速度變形 → **不能用 Half-Way Bounce Back**！
+
+實作**兩種方法**並支持切換：
 
 ```cuda
-// 方法 1: Half-Way Bounce Back (主要)
-__device__ void HalfwayBounceBack(
+// 方法 1: Non-Equilibrium Extrapolation (主要，Wet Node 適用)
+__device__ void NonEquilibriumExtrapolation(
     double *f_in,
-    int k,
-    int NZ6
+    double *f_eq_wall,     // 壁面平衡態
+    double *f_fluid,       // 最近的流體格點分佈函數
+    double *f_eq_fluid,    // 流體格點平衡態
+    double omega,
+    int k
 ) {
-    if (k == 3) {  // 下壁面
-        // f5 ↔ f6 (Z 向上 ↔ Z 向下)
-        double temp = f_in[5];
-        f_in[5] = f_in[6];
-        f_in[6] = temp;
-        // ... 其他方向
+    if (k == 3) {  // 下壁面 Wet Node
+        // f_α|wall = f_α^eq|wall + (1-ω)·(f_α - f_α^eq)|fluid
+        for (int alpha = 0; alpha < 19; alpha++) {
+            f_in[alpha] = f_eq_wall[alpha] +
+                          (1.0 - omega) * (f_fluid[alpha] - f_eq_fluid[alpha]);
+        }
     }
-    // 類似處理上壁面
 }
 
-// 方法 2: Chapman-Enskog 展開 (可選)
+// 方法 2: Chapman-Enskog 展開（精度更高）
 __device__ void ChapmanEnskogBC(
     double *f_in,
     double *f_eq,
-    double *velocity_gradient,  // ∂u/∂z
+    double *velocity_gradient,  // ∂u/∂ζ（計算空間）
     double omega,
     double dt,
     int k
 ) {
     // fα|wall = fα^eq [1 - ωΔt·(3Ui,aUi,b/c² - δab)·∂ua/∂xb]
+    // 考慮逆變速度的影響
     // ... 實作
 }
 
 // 切換開關
-#define BOUNDARY_METHOD 1  // 1: HalfwayBB, 2: ChapmanEnskog
+#define BOUNDARY_METHOD 1  // 1: NonEqExtrap, 2: ChapmanEnskog
 ```
 
-**驗證**: 平板 Poiseuille 流（有解析解）。
+**理論依據**：
+- 在 GILBM 中，ζ=0 處的格點是 **Wet Node**
+- 逆變速度 `ẽ_α_ζ` **空間變化**，不滿足 Half-Way BB 的標準晶格條件
+- 必須用 **Non-Equilibrium 方法**處理非平衡項
+
+**驗證**:
+1. 平板 Poiseuille 流（解析解）
+2. 檢查壁面無滑移條件：`|u_wall| < 1e-6`
 
 #### 任務 1.5: 整合到 evolution kernel (2天)
 
@@ -379,9 +499,34 @@ __device__ double Interpolate_Order6_3D(
 #### 任務 2.3: 性能優化 (1-2天)
 
 **策略**:
-- Shared memory 緩存局部數據
-- Texture memory（GPU 特性）
-- 預計算 Lagrange 權重表
+
+**1. 全局權重表（關鍵優化）**
+```cuda
+// 預計算不同分數位置的 Lagrange 權重
+__constant__ double LagrangeWeightTable[256][7];  // 256 個離散位置
+
+void PrecomputeWeightTable() {
+    for (int s_idx = 0; s_idx < 256; s_idx++) {
+        double s = -0.5 + s_idx / 256.0;  // 分數位置
+        ComputeLagrange6thWeights(s, LagrangeWeightTable[s_idx]);
+    }
+}
+
+// 運行時快速查表
+__device__ void Interpolate6th_Fast(double frac_pos) {
+    int idx = (int)((frac_pos + 0.5) * 256);
+    // 使用 LagrangeWeightTable[idx][0..6]
+}
+```
+
+**記憶體優化**：
+- **ISLBM**：56 個陣列 × NYD6 × NZ6 × 7 = ~3.4 MB
+- **GILBM**：1 個全局表 × 256 × 7 × 3 方向 = ~14 KB
+- **減少 130×**！
+
+**2. Shared memory 緩存局部數據**
+
+**3. Texture memory（GPU 特性）**
 
 #### 任務 2.4: 精度驗證 (網格收斂性測試) (1-2天)
 
@@ -455,11 +600,12 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 
 | 檔案 | Phase | 功能 |
 |------|-------|------|
-| `model_derivative.h` | 0 | HillFunctionDerivative (12段導數) |
-| `gilbm/gilbm_transform.h` | 1 | 度量項、逆變速度 |
+| `gilbm/discrete_jacobian.h` | 0 | **離散 Jacobian**（數值微分度量項） |
+| `gilbm/gilbm_transform.h` | 1 | 逆變速度計算 |
 | `gilbm/gilbm_rk2_upwind.h` | 1 | RK2 上風點追蹤 |
 | `gilbm/interpolationGILBM_order2.h` | 1 | 2階插值 |
-| `gilbm/boundary_conditions.h` | 1 | Half-Way BB + Chapman-Enskog |
+| `gilbm/boundary_conditions.h` | 1 | **Non-Equilibrium Extrapolation** + Chapman-Enskog |
+| `gilbm/weight_table.h` | 2 | **全局 Lagrange 權重表**（記憶體優化） |
 | `evolution_gilbm.h` | 1 | GILBM streaming-collision kernel |
 | `gilbm/interpolationGILBM_order6.h` | 2 | 6階插值 |
 | `gilbm/gilbm_local_timestep.h` | 3 | 局部時間步 |
@@ -504,10 +650,13 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 
 | 指標 | 頻率 | 目標 |
 |------|------|------|
+| **度量項合理性** | Phase 0 | Jacobian > 0，∂ζ/∂z > 0 |
 | 質量守恆 | 每步 | `\|ρ_avg - 1.0\| < 1e-6` |
 | 動量守恆 | 每 1000 步 | 殘差 < 1e-4 |
+| **壁面無滑移** | 每 1000 步 | `\|u_wall\| < 1e-6` |
 | 壁面剪應力 | 收斂後 | 與文獻值誤差 < 10% |
 | 網格收斂性 | Phase 2 | p ≥ 5 |
+| **記憶體使用** | Phase 2 | ≤ 500 KB（權重相關） |
 
 ### 對比基準
 
@@ -542,12 +691,35 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 
 ### 風險 3: 壁面邊界精度不足
 
-**症狀**: 壁面剪應力誤差 > 20%
+**症狀**:
+- 壁面剪應力誤差 > 20%
+- 壁面速度不為零（無滑移條件失效）
+
+**診斷**:
+1. 檢查逆變速度計算是否正確
+2. 驗證度量項數值微分精度
+3. 檢查 Non-Equilibrium Extrapolation 的流體格點選擇
 
 **降級方案**: 切換到 Chapman-Enskog 邊界條件：
 ```cuda
 #define BOUNDARY_METHOD 2
 ```
+
+### 風險 4: 度量項計算錯誤
+
+**症狀**:
+- Jacobian < 0（非物理）
+- 質量不守恆
+- 速度場異常發散
+
+**診斷**:
+1. 檢查數值微分的格點索引
+2. 驗證週期邊界處理
+3. 對比解析導數（在簡單區域）
+
+**降級方案**:
+- 增加數值微分精度（2 階 → 6 階 Lagrange）
+- 使用更密的網格
 
 ### 風險 4: 性能下降
 
@@ -557,6 +729,34 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 - Shared memory
 - Texture memory
 - 降低插值階數
+
+---
+
+## 📊 修正前後對比總結
+
+| 項目 | 原計劃（錯誤） | 修正後（正確） | 依據來源 |
+|------|--------------|--------------|---------|
+| **度量項計算** | 解析導數 H'(y) | **離散 Jacobian**（數值微分） | `initialization.h` 的 tanh 拉伸 |
+| **插值權重** | "無需預計算" | **全局權重表**（14 KB） | `memory.h` 的 56 個陣列分析 |
+| **邊界條件** | Half-Way Bounce Back | **Non-Equilibrium Extrapolation** | Wet Node + 逆變速度變形 |
+| **Phase 0 檔案** | `model_derivative.h` | `discrete_jacobian.h` | 基於實際網格座標 |
+| **記憶體優化** | 未量化 | **減少 130×**（3.4 MB → 14 KB） | 權重陣列統計 |
+| **邊界精度** | 依賴標準晶格 | 考慮**速度梯度修正** | Chapman-Enskog 理論 |
+
+### 關鍵發現來源
+
+1. **度量項修正**：
+   - 文件：`/Users/yetianzhong/Desktop/4.GitHub/D3Q27_PeriodicHill/initialization.h:110-136`
+   - 關鍵代碼：`z_h[j*NZ6+k] = tanhFunction(...) + HillFunction(y_j)`
+
+2. **插值權重分析**：
+   - 文件：`/Users/yetianzhong/Desktop/4.GitHub/D3Q27_PeriodicHill/memory.h:81-143`
+   - 統計：8 個方向 × 7 個權重陣列 × (NYD6×NZ6) = 2.43 MB
+
+3. **邊界條件**：
+   - 文件：`/Users/yetianzhong/Desktop/4.GitHub/D3Q27_PeriodicHill/evolution.h:147-160`
+   - 現有：k=3 的 Half-Way BB（Wet Node，但 Cartesian 框架）
+   - GILBM：Wet Node + 逆變速度 → 需要 Non-Equilibrium 方法
 
 ---
 
