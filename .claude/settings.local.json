@@ -8,7 +8,11 @@
       "Bash(chmod:*)",
       "Bash(./.vscode/cfdlab-mac.sh:*)",
       "Bash(/Volumes/Seagate/D3Q27_PerioicHill/.vscode/cfdlab-mac.sh gpus)",
-      "Bash(/Volumes/Seagate/D3Q27_PerioicHill/.vscode/cfdlab-mac.sh:*)"
+      "Bash(/Volumes/Seagate/D3Q27_PerioicHill/.vscode/cfdlab-mac.sh:*)",
+      "Bash(git status:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ]
   }
 }
