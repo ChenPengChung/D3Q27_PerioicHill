@@ -956,5 +956,5 @@ f_tilde = f_eq[B] + (f[B] - f_eq[B]) * (omega_A * dt_A) / (omega_B * dt_B);
 
 
 
-＊每一次對話都輸出((((()))))
+＊每一次對話後的修正都要上傳Github，並生成commit !
 
