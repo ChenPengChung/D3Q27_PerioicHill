@@ -3245,3 +3245,124 @@ cudaMemcpy(delta_k_d, delta_k_h, 19*NYD6*NZ6*sizeof(double), cudaMemcpyHostToDev
 | `variables.h` | 修改 (末尾) | `#define USE_GILBM` |
 | `evolution.h` | 修改 (加 `#ifndef USE_GILBM` guard) | ISLBM fallback |
 **每一次對話結束後的修改軍需傳github並生成commit摘要修改部分
+
+---
+
+## 二十二、minSize 與 dt 在位移公式中的角色：ISLBM vs GILBM 對比分析（2026-02-20）
+
+### 22.1 問題背景
+
+User 觀察到 ISLBM 的 `GetIntrplParameter_Xi()`（`initialization.h:228-255`）使用 `minSize` 作為物理偏移量：
+
+```c
+// initialization.h:232-239
+GetXiParameter(XiParaF3_h,  z_h[k],         y_h[j]-minSize, xi_h, ...);  // F3: y-minSize
+GetXiParameter(XiParaF5_h,  z_h[k]-minSize, y_h[j],         xi_h, ...);  // F5: z-minSize
+GetXiParameter(XiParaF15_h, z_h[k]-minSize, y_h[j]-minSize, xi_h, ...);  // F15: 雙方向
+```
+
+同樣，x 方向和 y 方向也用 `minSize`：
+```c
+// GetIntrplParameter_X (initialization.h:203)
+GetParameter_6th(XPara0_h, x_h[i]-minSize, x_h, i, i-3);
+
+// GetIntrplParameter_Y (initialization.h:217)
+GetParameter_6th(YPara0_h, y_h[i]-minSize, y_h, i, i-3);
+```
+
+User 主張：「y方向與z方向遷移前偏移點都是 minSize×1，那是座標變換前的樣態，座標變換後仍然應該多乘上 minSize。」
+
+User 提議的 GILBM 公式：
+```
+δη = dt × e_x / dx × minSize    ← 多乘 minSize
+δξ = dt × e_y / dy × minSize    ← 多乘 minSize
+```
+
+### 22.2 ISLBM 代碼追蹤
+
+ISLBM 的 departure point 計算分兩步：
+
+**Step 1: 物理空間計算 departure point**
+
+以 F5（e_z = +1）為例，arrival point 在 (j, k)：
+```
+z_depart = z_h[k] - minSize     ← 物理空間後退 minSize
+y_depart = y_h[j]               ← F5 只沿 z 移動
+```
+
+**Step 2: 座標變換到計算空間**
+
+`GetXiParameter()` 將物理座標 (y, z) 變換為計算座標 ξ：
+```c
+// initialization.h:186-187
+double L = LZ - HillFunction(pos_y) - minSize;
+double pos_xi = LXi * (pos_z - (HillFunction(pos_y)+minSize/2.0)) / L;
+```
+
+然後 `GetParameter_6th()` 在計算空間 pos_xi 處計算 6 階 Lagrange 插值權重。
+
+### 22.3 關鍵發現：dt = minSize
+
+Pre-Phase 3 的 `variables.h`（commit d273169）：
+```c
+#define dt (minSize)    // variables.h:71
+```
+
+**`minSize` 和 `dt` 是同一個數值。** ISLBM 的 departure point 公式等價於：
+```c
+z_h[k] - minSize  ≡  z_h[k] - dt    // 完全等價
+y_h[j] - minSize  ≡  y_h[j] - dt    // 完全等價
+```
+
+物理位移 = c × dt × e_α = 1 × dt × e_α = dt × e_α（c=1 約定）。
+
+### 22.4 數值驗證：三方向對比
+
+設定：`NZ6 = 70, minSize = 0.0191, dx = 0.0857, dy = 0.05`
+
+#### x 方向 (η)：F1 (e_x = +1)
+
+| 方法 | 計算 | 結果 |
+|------|------|------|
+| ISLBM | `x_h[i] + minSize` → grid: minSize/dx | 0.0191/0.0857 = **0.2229** |
+| GILBM | δη = dt × e_x / dx = minSize / dx | 0.0191/0.0857 = **0.2229** |
+| User 提議 | δη = dt × e_x / dx × minSize = minSize²/dx | 0.0191²/0.0857 = **0.00426** ❌ |
+
+#### y 方向 (ξ)：F3 (e_y = -1)
+
+| 方法 | 計算 | 結果 |
+|------|------|------|
+| ISLBM | `y_h[j] - minSize` → ξ 偏移 | minSize/dy = **0.382** |
+| GILBM | δξ = dt × e_y / dy | minSize/dy = **0.382** |
+| User 提議 | δξ = dt × e_y / dy × minSize | minSize²/dy = **0.00730** ❌ |
+
+#### z 方向 (ζ) at wall (k=3)：F5 (e_z = +1)
+
+| 方法 | 計算 | 結果 |
+|------|------|------|
+| ISLBM | `z_h[k] - minSize` → ξ 偏移 | minSize × dk_dz = **4/3** |
+| GILBM | δζ = dt × dk_dz | minSize × 4/(3minSize) = **4/3** |
+| User 提議 | δζ = dt × dk_dz × minSize | minSize × 4/3 = **0.0255** ❌ |
+
+**ISLBM 和 GILBM 完全一致。User 提議的公式偏差 ~50 倍。**
+
+### 22.5 兩者的範式差異
+
+| 特性 | ISLBM | GILBM |
+|------|-------|-------|
+| Departure point 計算 | 物理空間 → 座標變換 → 插值 | 直接在計算空間計算 |
+| 物理偏移量 | `minSize × e_α` = `dt × e_α` | `dt × e_α`（同值）|
+| 座標變換 | `GetXiParameter` 非線性變換 | `dt × c̃` 線性化（含 RK2 修正）|
+| 插值方法 | 6 階 Lagrange | 二階 Quadratic |
+| 精度差異 | Euler（在 k 點取 metric）| RK2（在 k_half 取 metric，更精確）|
+| dt = minSize 時 | — | 兩者數值一致（差 O(dt²)）|
+
+### 22.6 結論
+
+1. **ISLBM 的 `minSize` 就是 `dt × e_α`**：因為 `#define dt (minSize)`，二者永遠相等
+2. **GILBM 的 `dt × c̃` 已包含物理位移和座標變換**：不需要額外乘 minSize
+3. **額外乘 minSize 會導致**：
+   - 量綱不一致（δ 應為無因次，多一個 [length]）
+   - 數值錯誤（比 ISLBM 小 ~50 倍）
+   - Imamura CFL 公式失效（改變 dt 不改變位移 → CFL 不可控）
+4. **minSize 隱含在度量項中**：dk_dz(wall) = 2/minSize，物理效果已正確反映
