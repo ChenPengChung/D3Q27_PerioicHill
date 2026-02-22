@@ -17,7 +17,9 @@
       "Bash(find:*)",
       "Bash(python3:*)",
       "WebFetch(domain:www.scribd.com)",
-      "Bash(nvcc:*)"
+      "Bash(nvcc:*)",
+      "Bash(git -C /Volumes/iCloud雲端備份SanDisk/D3Q27_PeriodicHill add gilbm/precompute.h)",
+      "Bash(git -C:*)"
     ]
   }
 }
